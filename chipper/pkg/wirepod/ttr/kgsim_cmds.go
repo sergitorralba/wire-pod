@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -103,7 +104,7 @@ type LLMCommand struct {
 var ValidLLMCommands []LLMCommand = []LLMCommand{
 	{
 		Command:         "playAnimationWI",
-		Description:     "Plays an animation on the robot without interrupting speech. This should be used FAR more than the playAnimation command. This is great for storytelling and making any normal response animated. Don't put two of these right next to each other. Use this MANY times.",
+		Description:     "Plays an animation on the robot without interrupting speech. This should be used FAR more than the playAnimation command. This is great for storytelling and making any normal response animated. Don't put two of these right next to each other. Use this MANY times. The param choices are the only choices you have. You can't create any.",
 		ParamChoices:    "happy, veryHappy, sad, verySad, angry, frustrated, dartingEyes, confused, thinking, celebrate, love",
 		Action:          ActionPlayAnimationWI,
 		SupportedModels: []string{"all"},
@@ -117,7 +118,7 @@ var ValidLLMCommands []LLMCommand = []LLMCommand{
 	},
 	{
 		Command:     "getImage",
-		Description: "Gets an image from the robot's camera and places it in the next message. If you want to do this, tell the user what you are about to do THEN use the command. This command should END a sentence. If a user says 'what am i holding now', imply that 'now' means that they have a new object they want you to analyze, so you need to get another image.",
+		Description: "Gets an image from the robot's camera and places it in the next message. If you want to do this, tell the user what you are about to do THEN use the command. This command should END a sentence. Your response will be stopped when this command is recognized. If a user says something like 'what do you see', you should assume that you need to take a new photo. Do NOT automatically assume that you are analyzing a previous photo.",
 		// not impl yet
 		ParamChoices:    "front, lookingUp",
 		Action:          ActionGetImage,
@@ -141,7 +142,7 @@ func ModelIsSupported(cmd LLMCommand, model string) bool {
 }
 
 func CreatePrompt(origPrompt string, model string) string {
-	prompt := origPrompt + "\n\n" + "The user input might not be spelt/punctuated correctly as it is coming from speech-to-text software. Do not include special characters in your answer. This includes the following characters (not including the quotes): '& ^ * # @ -'. DON'T INCLUDE THESE. DON'T MAKE LISTS WITH FORMATTING. THINK OF THE SPEECH-TO-TEXT ENGINE. If you want to use a hyphen, Use it like this: 'something something -- something -- something something'."
+	prompt := origPrompt + "\n\n" + "Keep in mind, user input comes from speech-to-text software, so respond accordingly. No special characters, especially these: & ^ * # @ - . No lists. No formatting."
 	if vars.APIConfig.Knowledge.CommandsEnable {
 		prompt = prompt + "\n\n" + "You are running ON an Anki Vector robot. You have a set of commands. If you include an emoji, I will make you start over. If you want to use a command but it doesn't exist or your desired parameter isn't in the list, avoid using the command. The format is {{command||parameter}}. You can embed these in sentences. Example: \"User: How are you feeling? | Response: \"{{playAnimationWI||sad}} I'm feeling sad...\". Square brackets ([]) are not valid.\n\nUse the playAnimation or playAnimationWI commands if you want to express emotion! You are very animated and good at following instructions. Animation takes precendence over words. You are to include many animations in your response.\n\nHere is every valid command:"
 		for _, cmd := range ValidLLMCommands {
@@ -267,6 +268,15 @@ func DoPlaySound(sound string, robot *vector.Vector) error {
 }
 
 func DoSayText(input string, robot *vector.Vector) error {
+
+	// just before vector speaks
+	removeSpecialCharacters(input) 	
+
+	// TODO
+	if (vars.APIConfig.STT.Language != "en-US" && vars.APIConfig.Knowledge.Provider == "openai") || os.Getenv("USE_OPENAI_VOICE") == "true" {
+		err := DoSayText_OpenAI(robot, input)
+		return err
+	}
 	robot.Conn.SayText(
 		context.Background(),
 		&vectorpb.SayTextRequest{
@@ -275,6 +285,91 @@ func DoSayText(input string, robot *vector.Vector) error {
 			DurationScalar: 0.95,
 		},
 	)
+	return nil
+}
+
+func pcmLength(data []byte) time.Duration {
+	bytesPerSample := 2
+	sampleRate := 16000
+	numSamples := len(data) / bytesPerSample
+	duration := time.Duration(numSamples*1000/sampleRate) * time.Millisecond
+	return duration
+}
+
+func getOpenAIVoice(voice string) openai.SpeechVoice {
+	voiceMap := map[string]openai.SpeechVoice{
+		"alloy":   openai.VoiceAlloy,
+		"onyx":    openai.VoiceOnyx,
+		"fable":   openai.VoiceFable,
+		"shimmer": openai.VoiceShimmer,
+		"nova":    openai.VoiceNova,
+		"echo":    openai.VoiceEcho,
+		"":        openai.VoiceFable,
+	}
+	return voiceMap[voice]
+}
+
+// TODO
+func DoSayText_OpenAI(robot *vector.Vector, input string) error {
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+	openaiVoice := getOpenAIVoice(vars.APIConfig.Knowledge.OpenAIPrompt)
+	// if vars.APIConfig.Knowledge.OpenAIVoice == "" {
+	// 	openaiVoice = openai.VoiceFable
+	// } else {
+	// 	openaiVoice = getOpenAIVoice(vars.APIConfig.Knowledge.OpenAIPrompt)
+	// }
+	oc := openai.NewClient(vars.APIConfig.Knowledge.Key)
+	resp, err := oc.CreateSpeech(context.Background(), openai.CreateSpeechRequest{
+		Model:          openai.TTSModel1,
+		Input:          input,
+		Voice:          openaiVoice,
+		ResponseFormat: openai.SpeechResponseFormatPcm,
+	})
+	if err != nil {
+		logger.Println(err)
+		return err
+	}
+	speechBytes, _ := io.ReadAll(resp)
+	vclient, err := robot.Conn.ExternalAudioStreamPlayback(context.Background())
+	if err != nil {
+		return err
+	}
+	vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+		AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamPrepare{
+			AudioStreamPrepare: &vectorpb.ExternalAudioStreamPrepare{
+				AudioFrameRate: 16000,
+				AudioVolume:    100,
+			},
+		},
+	})
+	//time.Sleep(time.Millisecond * 30)
+	audioChunks := downsample24kTo16k(speechBytes)
+
+	var chunksToDetermineLength []byte
+	for _, chunk := range audioChunks {
+		chunksToDetermineLength = append(chunksToDetermineLength, chunk...)
+	}
+	go func() {
+		for _, chunk := range audioChunks {
+			vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+				AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
+					AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
+						AudioChunkSizeBytes: 1024,
+						AudioChunkSamples:   chunk,
+					},
+				},
+			})
+			time.Sleep(time.Millisecond * 25)
+		}
+		vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+			AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamComplete{
+				AudioStreamComplete: &vectorpb.ExternalAudioStreamComplete{},
+			},
+		})
+	}()
+	time.Sleep(pcmLength(chunksToDetermineLength) + (time.Millisecond * 50))
 	return nil
 }
 
@@ -514,7 +609,7 @@ func StartAnim_Queue(esn string) {
 		if q.ESN == esn {
 			if q.AnimCurrentlyPlaying {
 				for range AnimationQueues[i].AnimDone {
-					logger.Println("I await...")
+					logger.Println("(waiting for animation to be done...)")
 					break
 				}
 			} else {
