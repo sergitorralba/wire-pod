@@ -36,12 +36,10 @@ func PlaceChat(chat vars.RememberedChat) {
 	for i, achat := range vars.RememberedChats {
 		if achat.ESN == chat.ESN {
 			vars.RememberedChats[i] = chat
-			vars.SaveChats()
 			return
 		}
 	}
 	vars.RememberedChats = append(vars.RememberedChats, chat)
-	vars.SaveChats()
 }
 
 // remember last 16 lines of chat
@@ -68,7 +66,27 @@ func Remember(user, ai openai.ChatCompletionMessage, esn string) {
 }
 
 func isMn(r rune) bool {
-	return unicode.Is(unicode.Mn, r) // Mn: nonspacing marks
+	// Remove the characters that are not related to Vietnamese.
+	// Retain the tonal marks and diacritics such as the circumflex, ơ, and ư in Vietnamese.
+	keepMarks := []rune{
+		'\u0300', // Dấu huyền
+		'\u0301', // Dấu sắc
+		'\u0303', // Dấu ngã
+		'\u0309', // Dấu hỏi
+		'\u0323', // Dấu nặng
+		'\u0302', // Dấu mũ (â, ê, ô)
+		'\u031B', // Dấu ơ và ư
+		'\u0306', // Dấu trầm
+	}
+	if unicode.Is(unicode.Mn, r) {
+		for _, mark := range keepMarks {
+			if r == mark {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func removeSpecialCharacters(str string) string {
@@ -84,8 +102,8 @@ func removeSpecialCharacters(str string) string {
 	result = removeEmojis(re.ReplaceAllString(result, ""))
 
 	// Replace special characters with ASCII
-    // * COPY/PASTE TO ADD MORE CHARACTERS:
-    //   result = strings.ReplaceAll(result, "", "")
+	// * COPY/PASTE TO ADD MORE CHARACTERS:
+	//   result = strings.ReplaceAll(result, "", "")
 	result = strings.ReplaceAll(result, "‘", "'")
 	result = strings.ReplaceAll(result, "’", "'")
 	result = strings.ReplaceAll(result, "“", "\"")
@@ -105,10 +123,9 @@ func removeSpecialCharacters(str string) string {
 	result = strings.ReplaceAll(result, "®", "(r)")
 	result = strings.ReplaceAll(result, "™", "(tm)")
 	result = strings.ReplaceAll(result, "@", "(a)")
-	result = strings.ReplaceAll(result, " AI ", " A. I. ")	
+	result = strings.ReplaceAll(result, " AI ", " A. I. ")
 	return result
 }
-
 
 func removeEmojis(input string) string {
 	// a mess, but it works!
@@ -117,7 +134,7 @@ func removeEmojis(input string) string {
 	return result
 }
 
-func CreateAIReq(transcribedText, esn string, gpt3tryagain bool) openai.ChatCompletionRequest {
+func CreateAIReq(transcribedText, esn string, gpt3tryagain, isKG bool) openai.ChatCompletionRequest {
 	defaultPrompt := "You are a helpful, animated robot called Vector. Keep the response concise yet informative."
 
 	var nChat []openai.ChatCompletionMessage
@@ -136,14 +153,14 @@ func CreateAIReq(transcribedText, esn string, gpt3tryagain bool) openai.ChatComp
 	if gpt3tryagain {
 		model = openai.GPT3Dot5Turbo
 	} else if vars.APIConfig.Knowledge.Provider == "openai" {
-		model = openai.GPT4o
+		model = openai.GPT4oMini
 		logger.Println("Using " + model)
 	} else {
 		logger.Println("Using " + vars.APIConfig.Knowledge.Model)
 		model = vars.APIConfig.Knowledge.Model
 	}
 
-	smsg.Content = CreatePrompt(smsg.Content, model)
+	smsg.Content = CreatePrompt(smsg.Content, model, isKG)
 
 	nChat = append(nChat, smsg)
 	if vars.APIConfig.Knowledge.SaveChat {
@@ -169,7 +186,13 @@ func CreateAIReq(transcribedText, esn string, gpt3tryagain bool) openai.ChatComp
 	return aireq
 }
 
-func StreamingKGSim(req interface{}, esn string, transcribedText string) (string, error) {
+func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bool) (string, error) {
+	start := make(chan bool)
+	stop := make(chan bool)
+	stopStop := make(chan bool)
+	kgReadyToAnswer := make(chan bool)
+	kgStopLooping := false
+	ctx := context.Background()
 	matched := false
 	var robot *vector.Vector
 	var guid string
@@ -193,6 +216,24 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 	if err != nil {
 		return "", err
 	}
+	if isKG {
+		BControl(robot, ctx, start, stop)
+		go func() {
+			for {
+				if kgStopLooping {
+					kgReadyToAnswer <- true
+					break
+				}
+				robot.Conn.PlayAnimation(ctx, &vectorpb.PlayAnimationRequest{
+					Animation: &vectorpb.Animation{
+						Name: "anim_knowledgegraph_searching_01",
+					},
+					Loops: 1,
+				})
+				time.Sleep(time.Second / 3)
+			}
+		}()
+	}
 	var fullRespText string
 	var fullfullRespText string
 	var fullRespSlice []string
@@ -213,18 +254,18 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 	} else if vars.APIConfig.Knowledge.Provider == "openai" {
 		c = openai.NewClient(vars.APIConfig.Knowledge.Key)
 	}
-	ctx := context.Background()
 	speakReady := make(chan string)
 	successIntent := make(chan bool)
 
-	aireq := CreateAIReq(transcribedText, esn, false)
+	aireq := CreateAIReq(transcribedText, esn, false, isKG)
 
 	stream, err := c.CreateChatCompletionStream(ctx, aireq)
 	if err != nil {
+        	log.Printf("Error creating chat completion stream: %v", err)
 		if strings.Contains(err.Error(), "does not exist") && vars.APIConfig.Knowledge.Provider == "openai" {
 			logger.Println("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
 			logger.LogUI("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
-			aireq := CreateAIReq(transcribedText, esn, true)
+			aireq := CreateAIReq(transcribedText, esn, true, isKG)
 			logger.Println("Falling back to " + aireq.Model)
 			logger.LogUI("Falling back to " + aireq.Model)
 			stream, err = c.CreateChatCompletionStream(ctx, aireq)
@@ -233,6 +274,15 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 				return "", err
 			}
 		} else {
+			if isKG {
+				kgStopLooping = true
+				for range kgReadyToAnswer {
+					break
+				}
+				stop <- true
+				time.Sleep(time.Second / 3)
+				KGSim(esn, "There was an error getting data from the L. L. M.")
+			}
 			return "", err
 		}
 	}
@@ -245,13 +295,23 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 		for {
 			response, err := stream.Recv()
 			if errors.Is(err, io.EOF) {
-				// if fullRespSlice != fullRespText, add that missing bit to fullRespSlice
+				// prevents a crash
 				if len(fullRespSlice) == 0 {
 					logger.Println("LLM returned no response")
 					successIntent <- false
+					if isKG {
+						kgStopLooping = true
+						for range kgReadyToAnswer {
+							break
+						}
+						stop <- true
+						time.Sleep(time.Second / 3)
+						KGSim(esn, "There was an error getting data from the L. L. M.")
+					}
 					break
 				}
 				isDone = true
+				// if fullRespSlice != fullRespText, add that missing bit to fullRespSlice
 				newStr := fullRespSlice[0]
 				for i, str := range fullRespSlice {
 					if i == 0 {
@@ -284,6 +344,11 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 				logger.Println("Stream error: " + err.Error())
 				return
 			}
+
+            		if (len(response.Choices) == 0) {
+                		logger.Println("Empty response")
+                		return
+            		}
 
 			fullfullRespText = fullfullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
 			fullRespText = fullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
@@ -318,81 +383,48 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 	}()
 	for is := range successIntent {
 		if is {
-			IntentPass(req, "intent_greeting_hello", transcribedText, map[string]string{}, false)
+			if !isKG {
+				IntentPass(req, "intent_greeting_hello", transcribedText, map[string]string{}, false)
+			}
 			break
 		} else {
 			return "", errors.New("llm returned no response")
 		}
 	}
 	time.Sleep(time.Millisecond * 200)
-	controlRequest := &vectorpb.BehaviorControlRequest{
-		RequestType: &vectorpb.BehaviorControlRequest_ControlRequest{
-			ControlRequest: &vectorpb.ControlRequest{
-				Priority: vectorpb.ControlRequest_OVERRIDE_BEHAVIORS,
-			},
-		},
+	if !isKG {
+		BControl(robot, ctx, start, stop)
 	}
-	start := make(chan bool)
-	stop := make(chan bool)
-
+	interrupted := false
 	go func() {
-		// * begin - modified from official vector-go-sdk
-		r, err := robot.Conn.BehaviorControl(
-			ctx,
-		)
-		if err != nil {
-			logger.Println(err)
-			return
-		}
-
-		if err := r.Send(controlRequest); err != nil {
-			logger.Println(err)
-			return
-		}
-
-		for {
-			ctrlresp, err := r.Recv()
-			if err != nil {
-				logger.Println(err)
-				return
-			}
-			if ctrlresp.GetControlGrantedResponse() != nil {
-				start <- true
-				break
-			}
-		}
-
-		for {
-			select {
-			case <-stop:
-				logger.Println("KGSim: releasing behavior control (interrupt)")
-				if err := r.Send(
-					&vectorpb.BehaviorControlRequest{
-						RequestType: &vectorpb.BehaviorControlRequest_ControlRelease{
-							ControlRelease: &vectorpb.ControlRelease{},
-						},
-					},
-				); err != nil {
-					logger.Println(err)
-					return
-				}
-				return
-			default:
-				continue
-			}
-		}
-		// * end - modified from official vector-go-sdk
+		interrupted = InterruptKGSimWhenTouchedOrWaked(robot, stop, stopStop)
 	}()
+	var TTSLoopAnimation string
+	var TTSGetinAnimation string
+	if isKG {
+		TTSLoopAnimation = "anim_knowledgegraph_answer_01"
+		TTSGetinAnimation = "anim_knowledgegraph_searching_getout_01"
+	} else {
+		TTSLoopAnimation = "anim_tts_loop_02"
+		TTSGetinAnimation = "anim_getin_tts_01"
+	}
 
 	var stopTTSLoop bool
 	TTSLoopStopped := make(chan bool)
 	for range start {
-		time.Sleep(time.Millisecond * 300)
+		if isKG {
+			kgStopLooping = true
+			for range kgReadyToAnswer {
+				break
+			}
+		} else {
+			time.Sleep(time.Millisecond * 300)
+		}
 		robot.Conn.PlayAnimation(
 			ctx,
 			&vectorpb.PlayAnimationRequest{
 				Animation: &vectorpb.Animation{
-					Name: "anim_getin_tts_01",
+					Name: TTSGetinAnimation,
 				},
 				Loops: 1,
 			},
@@ -408,7 +440,7 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 						ctx,
 						&vectorpb.PlayAnimationRequest{
 							Animation: &vectorpb.Animation{
-								Name: "anim_tts_loop_02",
+								Name: TTSLoopAnimation,
 							},
 							Loops: 1,
 						},
@@ -431,10 +463,13 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 					break
 				}
 			}
+			if interrupted {
+				break
+			}
 			logger.Println(respSlice[numInResp])
 			acts := GetActionsFromString(respSlice[numInResp])
 			nChat[len(nChat)-1].Content = fullRespText
-			disconnect = PerformActions(nChat, acts, robot)
+			disconnect = PerformActions(nChat, acts, robot, stopStop)
 			if disconnect {
 				break
 			}
@@ -447,17 +482,22 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string) (string
 			}
 		}
 		time.Sleep(time.Millisecond * 100)
-		// robot.Conn.PlayAnimation(
-		// 	ctx,
-		// 	&vectorpb.PlayAnimationRequest{
-		// 		Animation: &vectorpb.Animation{
-		// 			Name: "anim_knowledgegraph_success_01",
+		// if isKG {
+		// 	robot.Conn.PlayAnimation(
+		// 		ctx,
+		// 		&vectorpb.PlayAnimationRequest{
+		// 			Animation: &vectorpb.Animation{
+		// 				Name: "anim_knowledgegraph_success_01",
+		// 			},
+		// 			Loops: 1,
 		// 		},
-		// 		Loops: 1,
-		// 	},
-		// )
-		//time.Sleep(time.Millisecond * 3300)
-		stop <- true
+		// 	)
+		// 	time.Sleep(time.Millisecond * 3300)
+		// }
+		if !interrupted {
+			stopStop <- true
+			stop <- true
+		}
 	}
 	return "", nil
 }
@@ -598,15 +638,6 @@ func KGSim(esn string, textToSay string) error {
 				}
 			}
 			time.Sleep(time.Millisecond * 100)
-			robot.Conn.PlayAnimation(
-				ctx,
-				&vectorpb.PlayAnimationRequest{
-					Animation: &vectorpb.Animation{
-						Name: "anim_knowledgegraph_success_01",
-					},
-					Loops: 1,
-				},
-			)
 			//time.Sleep(time.Millisecond * 3300)
 			stop <- true
 		}
