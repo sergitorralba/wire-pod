@@ -90,16 +90,16 @@ function getPackages() {
     echo "Installing required packages"
     if [[ ${TARGET} == "debian" ]]; then
         apt update -y
-        apt install -y wget openssl net-tools libsox-dev libopus-dev make iproute2 xz-utils libopusfile-dev pkg-config gcc curl g++ unzip avahi-daemon git libasound2-dev libsodium-dev cmake
+        apt install -y wget openssl net-tools libsox-dev libopus-dev make iproute2 xz-utils libopusfile-dev pkg-config gcc curl g++ unzip avahi-daemon git libasound2-dev libsodium-dev cmake lld
         elif [[ ${TARGET} == "arch" ]]; then
         pacman -Sy --noconfirm
-        sudo pacman -S --noconfirm wget openssl net-tools sox opus make iproute2 opusfile curl unzip avahi git libsodium go pkg-config cmake
+        sudo pacman -S --noconfirm wget openssl net-tools sox opus make iproute2 opusfile curl unzip avahi git libsodium go pkg-config cmake lld
         elif [[ ${TARGET} == "fedora" ]]; then
         dnf update
-        dnf install -y wget openssl net-tools sox opus make opusfile curl unzip avahi git libsodium-devel cmake
+        dnf install -y wget openssl net-tools sox opus make opusfile curl unzip avahi git libsodium-devel cmake lld
         elif [[ ${TARGET} == "darwin" ]]; then
         sudo -u $SUDO_USER brew update
-        sudo -u $SUDO_USER brew install wget pkg-config opus opusfile cmake
+        sudo -u $SUDO_USER brew install wget pkg-config opus opusfile cmake lld
     fi
     touch ./vector-cloud/packagesGotten
     echo
@@ -548,6 +548,8 @@ function setupSystemd() {
     source ./chipper/source.sh
     echo "[Unit]" >wire-pod.service
     echo "Description=Wire Escape Pod (coqui)" >>wire-pod.service
+    echo "Wants=network.target" >>wire-pod.service
+    echo "After=network.target" >>wire-pod.service
     echo "StartLimitIntervalSec=500" >>wire-pod.service
     echo "StartLimitBurst=5" >>wire-pod.service
     echo >>wire-pod.service
